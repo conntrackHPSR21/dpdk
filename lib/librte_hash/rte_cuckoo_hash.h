@@ -127,12 +127,19 @@ struct lcore_cache {
 	uint32_t objs[LCORE_CACHE_SIZE]; /**< Cache objects */
 } __rte_cache_aligned;
 
+
+#define LIBRTE_HASH_HAS_AGING 1
+
+#define LAST_SEEN(h,slot) (((struct rte_hash_key *) (((char *)(h->key_store))+ (slot * h->key_entry_size))) -> last_seen)
+#define LAST_SEEN_PTR(h,slot) (&(((struct rte_hash_key *) (((char *)(h->key_store))+ (slot * h->key_entry_size))) -> last_seen))
+
 /* Structure that stores key-value pair */
 struct rte_hash_key {
 	union {
 		uintptr_t idata;
 		void *pdata;
 	};
+	age_t last_seen;
 	/* Variable key size */
 	char key[0];
 };
@@ -225,6 +232,9 @@ struct rte_hash {
 	uint32_t *ext_bkt_to_free;
 	uint32_t *tbl_chng_cnt;
 	/**< Indicates if the hash table changed from last read. */
+
+	age_t lifetime;
+	uint8_t always_recycle;
 } __rte_cache_aligned;
 
 struct queue_node {

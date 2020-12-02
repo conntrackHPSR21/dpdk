@@ -38,12 +38,63 @@
 				   RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY | \
 				   RTE_HASH_EXTRA_FLAGS_EXT_TABLE |	\
 				   RTE_HASH_EXTRA_FLAGS_NO_FREE_ON_DEL | \
-				   RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF)
+				   RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF |   \
+				   RTE_HASH_EXTRA_FLAGS_ALWAYS_RECYCLE	)
 
 #define FOR_EACH_BUCKET(CURRENT_BKT, START_BUCKET)                            \
 	for (CURRENT_BKT = START_BUCKET;                                      \
 		CURRENT_BKT != NULL;                                          \
 		CURRENT_BKT = CURRENT_BKT->next)
+
+
+
+#define PRINT(...) RTE_LOG(ERR,HASH, __VA_ARGS__);
+//#define ALLOC_PRINT(n) RTE_LOG(ERR,HASH,"%s:%i allocation of %lu bytes\n", __FUNCTION__, __LINE__, n);
+#define ALLOC_PRINT(n) (void)0;
+
+
+#define EXPIRY_DEBUG 0
+#define PRINT_TABLE 0
+
+#if defined(EXPIRY_DEBUG) && EXPIRY_DEBUG
+#define EXPIRY_DBG(...) PRINT(__VA_ARGS__);
+#else
+#define EXPIRY_DBG(...) (void)0; 
+#endif
+
+#if defined(PRINT_TABLE) && PRINT_TABLE
+void print_table(struct rte_hash * h)
+{
+	struct rte_hash_key * key;
+	PRINT("---------------- TABLE entries=%i, buckets=%i ----------\n", h->entries, h->num_buckets);
+	for(int i=0; i< h->num_buckets; i++)
+	{
+		char s[1000], s1[1000];
+		s[0] = 0; s1[0] = 0;
+		for( int j=0; j< RTE_HASH_BUCKET_ENTRIES; j++)
+		{
+			sprintf(s, "%s%04X, ", s, h->buckets[i].sig_current[j]);
+			sprintf(s1, "%s%i, ", s1, h->buckets[i].key_idx[j]);
+
+		}
+		PRINT(" BUCKET %i: [%s] [%s]\n", i, s, s1);
+	}
+	for(int i=0; i< h->entries; i++)
+	{
+		key = RTE_PTR_ADD(h->key_store, i * h->key_entry_size);
+		PRINT("%i: key is %04X data %04X last seen %i (%p)\n",
+				i, *(uint64_t *) key->key, key->idata, 
+				key->last_seen,
+				&(key->last_seen));
+	}
+	PRINT("------------------------------------------------ \n");
+}
+#else
+#define print_table(...) (void)0; 
+#endif
+
+
+
 
 TAILQ_HEAD(rte_hash_list, rte_tailq_entry);
 
@@ -98,6 +149,12 @@ void rte_hash_set_cmp_func(struct rte_hash *h, rte_hash_cmp_eq_t func)
 static inline int
 rte_hash_cmp_eq(const void *key1, const void *key2, const struct rte_hash *h)
 {
+    EXPIRY_DBG( "COMPARING %04X (at %p), %04X (at %p), length is %i\n",
+		* (const uint32_t *) key1,
+		(const uint32_t *) key1,
+		* (const uint32_t *) key2,
+		(const uint32_t *) key2,
+		h->key_len);
 	if (h->cmp_jump_table_idx == KEY_CUSTOM)
 		return h->rte_hash_custom_cmp_eq(key1, key2, h->key_len);
 	else
@@ -134,6 +191,44 @@ get_alt_bucket_index(const struct rte_hash *h,
 	return (cur_bkt_idx ^ sig) & h->bucket_bitmask;
 }
 
+
+static inline age_t
+refresh_age(const struct rte_hash *h, age_t recent, int slot)
+{
+	if( h->lifetime == 0 || unlikely(slot < 0))
+		return 0;
+	EXPIRY_DBG("Age refreshed at slot %i (key is %04X). last seen at %lu (%p)\n",
+		slot,
+		((struct rte_hash_key *) ((char *)(h->key_store)+ slot * h->key_entry_size)) -> key,
+	*LAST_SEEN_PTR(h, slot),
+	LAST_SEEN_PTR(h, slot));
+		// &((struct rte_hash_key *) ((char *)(h->key_store)+ slot * h->key_entry_size)) -> last_seen),
+		// &((struct rte_hash_key *) ((char *)(h->key_store)+ slot * h->key_entry_size)) -> last_seen);
+
+    return LAST_SEEN(h, slot) = recent;
+}
+
+static inline bool
+is_expired(const struct rte_hash *h, age_t recent, int slot)
+{
+    // EXPIRY_DBG("Expired at %i? %i -> %i, last seen at %lu %p. recent is %lu\n",
+		    // slot,
+		    // *LAST_SEEN_PTR(h, slot),
+			 // recent > (*LAST_SEEN_PTR(h, slot) + h->lifetime),
+			 // *LAST_SEEN_PTR(h,slot),
+			 // LAST_SEEN_PTR(h,slot),
+			 // recent);
+
+    return recent - LAST_SEEN(h, slot) >= h->lifetime;
+}
+
+static inline age_t
+get_age(const struct rte_hash *h, age_t recent, int slot)
+{
+    return recent - LAST_SEEN(h, slot);
+}
+
+
 struct rte_hash *
 rte_hash_create(const struct rte_hash_parameters *params)
 {
@@ -159,6 +254,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	struct lcore_cache *local_free_slots = NULL;
 	unsigned int readwrite_concur_lf_support = 0;
 	uint32_t i;
+	uint8_t always_recycle = 0;
 
 	rte_hash_function default_hash_func = (rte_hash_function)rte_jhash;
 
@@ -222,6 +318,11 @@ rte_hash_create(const struct rte_hash_parameters *params)
 		no_free_on_del = 1;
 	}
 
+	if (params->extra_flag & RTE_HASH_EXTRA_FLAGS_ALWAYS_RECYCLE) {
+		always_recycle = 1;
+	}
+
+
 	/* Store all keys and leave the first entry as a dummy entry for lookup_bulk */
 	if (use_local_cache)
 		/*
@@ -236,10 +337,12 @@ rte_hash_create(const struct rte_hash_parameters *params)
 
 	snprintf(ring_name, sizeof(ring_name), "HT_%s", params->name);
 	/* Create ring (Dummy slot index is not enqueued) */
+	ALLOC_PRINT(sizeof(uint32_t)* rte_align32pow2(num_key_slots));
 	r = rte_ring_create_elem(ring_name, sizeof(uint32_t),
 			rte_align32pow2(num_key_slots), params->socket_id, 0);
 	if (r == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		RTE_LOG(ERR, HASH, "%s:%i memory allocation failed\n",
+				__FILE__, __LINE__);
 		goto err;
 	}
 
@@ -250,13 +353,15 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	if (ext_table_support) {
 		snprintf(ext_ring_name, sizeof(ext_ring_name), "HT_EXT_%s",
 								params->name);
+		ALLOC_PRINT(sizeof(uint32_t)* rte_align32pow2(num_buckets+1));
 		r_ext = rte_ring_create_elem(ext_ring_name, sizeof(uint32_t),
 				rte_align32pow2(num_buckets + 1),
 				params->socket_id, 0);
 
 		if (r_ext == NULL) {
-			RTE_LOG(ERR, HASH, "ext buckets memory allocation "
-								"failed\n");
+			RTE_LOG(ERR, HASH, "%s:%i ext buckets memory allocation "
+								"failed\n",
+						__FILE__, __LINE__);
 			goto err;
 		}
 	}
@@ -279,19 +384,24 @@ rte_hash_create(const struct rte_hash_parameters *params)
 		goto err_unlock;
 	}
 
+	ALLOC_PRINT(sizeof(*te));
 	te = rte_zmalloc("HASH_TAILQ_ENTRY", sizeof(*te), 0);
 	if (te == NULL) {
 		RTE_LOG(ERR, HASH, "tailq entry allocation failed\n");
 		goto err_unlock;
 	}
 
+	ALLOC_PRINT(sizeof(struct rte_hash));
 	h = (struct rte_hash *)rte_zmalloc_socket(hash_name, sizeof(struct rte_hash),
 					RTE_CACHE_LINE_SIZE, params->socket_id);
 
 	if (h == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		RTE_LOG(ERR, HASH, "%s:%i memory allocation failed\n",
+				__FILE__,__LINE__);
 		goto err_unlock;
 	}
+
+	ALLOC_PRINT(num_buckets * sizeof(struct rte_hash_bucket));
 
 	buckets = rte_zmalloc_socket(NULL,
 				num_buckets * sizeof(struct rte_hash_bucket),
@@ -336,11 +446,13 @@ rte_hash_create(const struct rte_hash_parameters *params)
 			  KEY_ALIGNMENT);
 	const uint64_t key_tbl_size = (uint64_t) key_entry_size * num_key_slots;
 
+	ALLOC_PRINT(key_tbl_size);
 	k = rte_zmalloc_socket(NULL, key_tbl_size,
 			RTE_CACHE_LINE_SIZE, params->socket_id);
 
 	if (k == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		RTE_LOG(ERR, HASH, "%s:%i memory allocation failed\n",
+				__FILE__, __LINE__);
 		goto err_unlock;
 	}
 
@@ -348,7 +460,8 @@ rte_hash_create(const struct rte_hash_parameters *params)
 			RTE_CACHE_LINE_SIZE, params->socket_id);
 
 	if (tbl_chng_cnt == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		RTE_LOG(ERR, HASH, "%s:%i memory allocation failed\n",
+				__FILE__, __LINE__);
 		goto err_unlock;
 	}
 
@@ -392,6 +505,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
 #endif
 
 	if (use_local_cache) {
+		ALLOC_PRINT(sizeof(struct lcore_cache) * RTE_MAX_LCORE);
 		local_free_slots = rte_zmalloc_socket(NULL,
 				sizeof(struct lcore_cache) * RTE_MAX_LCORE,
 				RTE_CACHE_LINE_SIZE, params->socket_id);
@@ -435,7 +549,17 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	h->writer_takes_lock = writer_takes_lock;
 	h->no_free_on_del = no_free_on_del;
 	h->readwrite_concur_lf_support = readwrite_concur_lf_support;
+	h->lifetime = params->lifetime;
 
+	if (always_recycle == 1)
+	{
+		if (h->lifetime == 0)
+			RTE_LOG(ERR, HASH,
+			  "rte_hash_create: setting always_recycle without "
+			  "a valid timeout! It will be ignored.\n");
+		else
+			h->always_recycle = 1;
+	}
 #if defined(RTE_ARCH_X86)
 	if (rte_cpu_get_flag_enabled(RTE_CPUFLAG_SSE2))
 		h->sig_cmp_fn = RTE_HASH_COMPARE_SSE;
@@ -717,12 +841,89 @@ search_and_update(const struct rte_hash *h, void *data, const void *key,
 				 * Return index where key is stored,
 				 * subtracting the first dummy index
 				 */
+				EXPIRY_DBG("Found entry at %i\n", bkt->key_idx[i]-1);
 				return bkt->key_idx[i] - 1;
 			}
 		}
 	}
 	return -1;
 }
+static inline int32_t
+search_and_update_or_recycle (const struct rte_hash *h, void *data, const void *key,
+	struct rte_hash_bucket *bkt, uint16_t sig, uint32_t *recycled, age_t recent)
+{
+	int i;
+	struct rte_hash_key *k, *keys = h->key_store;
+
+	*recycled = 0;
+
+	for (i = 0; i < RTE_HASH_BUCKET_ENTRIES; i++) {
+		// EXPIRY_DBG(" lifetime %i, keyidx %i, conditions %i\n",
+		// h->lifetime != 0, bkt->key_idx[i],
+		// (h->lifetime != 0  && bkt->key_idx[i] >0 && bkt->key_idx[i] < h->entries));
+		if (bkt->sig_current[i] == sig) {
+			k = (struct rte_hash_key *) ((char *)keys +
+					bkt->key_idx[i] * h->key_entry_size);
+
+			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
+				/* The store to application data at *data
+				 * should not leak after the store to pdata
+				 * in the key store. i.e. pdata is the guard
+				 * variable. Release the application data
+				 * to the readers.
+				 */
+				__atomic_store_n(&k->pdata,
+					data,
+					__ATOMIC_RELEASE);
+				/*
+				 * Return index where key is stored,
+				 * subtracting the first dummy index
+				 */
+				EXPIRY_DBG("Found entry at %i\n", bkt->key_idx[i]-1);
+				return bkt->key_idx[i] - 1;
+			}
+		}
+        //	else if (bkt->key_idx[i] != EMPTY_SLOT && h->lifetime && is_expired(h, bkt->key_idx[i] - 1))
+		else if (h->lifetime != 0 && *recycled == 0 && bkt->key_idx[i] > 0
+			  && is_expired(h, recent, bkt->key_idx[i] - 1))
+		{
+
+			k = (struct rte_hash_key *) ((char *)keys +
+					(bkt->key_idx[i] -1) * h->key_entry_size);
+			EXPIRY_DBG("Expired candidate is at index %i, bkt->key_idx[%i]-1 is %i. Key is %i, last seen at %i (%p)\n",
+					i, i, (bkt->key_idx[i] -1), k->key, k->last_seen,
+					&(k->last_seen));
+			*recycled = i;
+		}/*
+		else if (bkt->key_idx[i] == EMPTY_SLOT ) // We don't want to recycle if there is still some space
+		{
+			EXPIRY_DBG("Found an empty slot at %i. Discarding %i as candidate\n",
+					bkt->key_idx[i] - 1, bkt->key_idx[*recycled] - 1 );
+			*recycled = i;
+		}*/
+		
+	}
+	return -1;
+}
+
+
+/*
+		if ( h->lifetime != 0
+			&& bkt->key_idx[i] >0 && bkt->key_idx[i] < h->entries
+			  && is_expired(h, recent, bkt->key_idx[i] - 1))
+		{
+				if (bkt->sig_current[i] != sig)
+					bkt->sig_current[i] = sig;
+				memcpy(k->key, key, h->key_len);
+
+				__atomic_store_n(&k->pdata,
+					data,
+					__ATOMIC_RELEASE);
+
+				EXPIRY_DBG("Found entry at %i\n", bkt->key_idx[i]-1);
+				return bkt->key_idx[i] - 1;
+		}
+		*/
 
 /* Only tries to insert at one bucket (@prim_bkt) without trying to push
  * buckets around.
@@ -768,6 +969,11 @@ rte_hash_cuckoo_insert_mw(const struct rte_hash *h,
 		/* Check if slot is available */
 		if (likely(prim_bkt->key_idx[i] == EMPTY_SLOT)) {
 			prim_bkt->sig_current[i] = sig;
+			EXPIRY_DBG("Set signature prim_bkt->sig_current[%i] = %04X\n",
+				i, sig);
+					// Signature at index %i (%p) has been set to %04X (%04X)\n",
+					// i, prim_bkt->sig_current[i],
+					// &(prim_bkt->sig_current[i]), sig, prim_bkt->sig_current[i]);
 			/* Store to signature and key should not
 			 * leak after the store to key_idx. i.e.
 			 * key_idx is the guard variable for signature
@@ -776,6 +982,8 @@ rte_hash_cuckoo_insert_mw(const struct rte_hash *h,
 			__atomic_store_n(&prim_bkt->key_idx[i],
 					 new_idx,
 					 __ATOMIC_RELEASE);
+			EXPIRY_DBG("__atomic_store_n(&prim_bkt->key_idx[i(%i)], new_idx (%i), __ATOMIC_RELEASE)\n",
+				i, new_idx);
 			break;
 		}
 	}
@@ -1004,9 +1212,152 @@ alloc_slot(const struct rte_hash *h, struct lcore_cache *cached_free_slots)
 	return slot_id;
 }
 
+
+static inline void
+recycle_entry(const struct rte_hash *h,
+		const struct rte_hash_key *keys,
+                struct rte_hash_bucket *bkt,
+                const void *key, uint32_t idx, 
+		hash_sig_t sig, void *data,
+		void * old_key, void * old_data, age_t recent) {
+
+	//idx-=1;
+	uint32_t slot = bkt->key_idx[idx];
+	slot-=1;
+	struct rte_hash_key * new_k = RTE_PTR_ADD(keys, slot * h->key_entry_size);
+	uint16_t* new_sig = &(bkt->sig_current[idx]);
+	uintptr_t * new_data = &(new_k->idata);
+
+	EXPIRY_DBG("RECYCLING INDEX %i -> SLOT %i. Had signature %04X and key %08X. Data is %i. Age is %i (args %i). lastseen is %i (%p)\n",
+				idx, slot,
+				*new_sig,
+				((const uint64_t *) new_k->key)[0],
+				*new_data,
+				get_age(h, recent, slot), slot,
+				*LAST_SEEN_PTR(h, slot),
+				LAST_SEEN_PTR(h, slot));
+
+	EXPIRY_DBG("KEY at %p, SIGNATURE at %p, DATA at %p\n", new_k, new_sig, new_data);
+
+	memcpy(old_key, new_k->key, h->key_len); // Return the old key to the application
+	memcpy(old_data, new_data, sizeof(uintptr_t));	//And also the old data
+
+	
+
+	memcpy(new_k->key, key, h->key_len);
+	*new_sig = sig;
+	refresh_age(h, recent, slot);
+
+	__atomic_store_n(&new_k->pdata, data, __ATOMIC_RELEASE);
+
+	EXPIRY_DBG("POST: INDEX %i -> SLOT %i. Has signature %04X and key %08X. Data is %i. Age is %i (args %i). lastseen is %i \n",
+				idx, slot,
+				*new_sig,
+				((const uint64_t *) new_k->key)[0],
+				*new_data,
+				get_age(h, recent, slot), slot,
+				recent);
+
+}
+
+
+/* Only tries to insert at one bucket (@prim_bkt) without trying to push
+ * buckets around.
+ * return 1 if matching existing key, return 0 if succeeds, return -1 for no
+ * empty entry.
+ */
 static inline int32_t
-__rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
-						hash_sig_t sig, void *data)
+rte_hash_cuckoo_insert_mw_t(const struct rte_hash *h,
+		struct rte_hash_bucket *prim_bkt,
+		struct rte_hash_bucket *sec_bkt,
+		const struct rte_hash_key *key, void *data,
+		uint16_t sig, uint32_t new_idx,
+		int32_t *ret_val, void * old_key, void * old_data, age_t recent)
+{
+	unsigned int i;
+	struct rte_hash_bucket *cur_bkt;
+	int32_t ret;
+    uint32_t recycled = 0;
+	__hash_rw_writer_lock(h);
+	/* Check if key was inserted after last check but before this
+	 * protected region in case of inserting duplicated keys.
+	 */
+	ret = search_and_update_or_recycle(h, data, key, prim_bkt, sig, &recycled, recent);
+	if (ret != -1) {
+		__hash_rw_writer_unlock(h);
+
+		refresh_age(h, recent, ret + 1);
+		*ret_val = ret;
+		return 1;
+	}
+
+    if(recycled != 0) {
+               recycle_entry(h, h->key_store, prim_bkt, key, recycled,
+                               sig, data, old_key, old_data, recent);
+
+               __hash_rw_writer_unlock(h);
+                *ret_val = recycled;
+               return 1;
+    }
+
+
+	FOR_EACH_BUCKET(cur_bkt, sec_bkt) {
+		ret = search_and_update_or_recycle(h, data, key, cur_bkt, sig, &recycled, recent);
+		if (ret != -1) {
+			__hash_rw_writer_unlock(h);
+			*ret_val = ret;
+		    refresh_age(h, recent, ret + 1);
+			return 1;
+		}
+        if(recycled != 0) {
+           recycle_entry(h, h->key_store, cur_bkt, key, recycled,
+                           sig, data, old_key, old_data, recent);
+           __hash_rw_writer_unlock(h);
+           *ret_val = recycled;
+           return 1;
+        }
+	}
+
+	/* Insert new entry if there is room in the primary
+	 * bucket.
+	 */
+	for (i = 0; i < RTE_HASH_BUCKET_ENTRIES; i++) {
+		/* Check if slot is available */
+		if (likely(prim_bkt->key_idx[i] == EMPTY_SLOT)) {
+			prim_bkt->sig_current[i] = sig;
+			EXPIRY_DBG("Set signature prim_bkt->sig_current[%i] = %04X\n",
+				i, sig);
+					// Signature at index %i (%p) has been set to %04X (%04X)\n",
+					// i, prim_bkt->sig_current[i],
+					// &(prim_bkt->sig_current[i]), sig, prim_bkt->sig_current[i]);
+			/* Store to signature and key should not
+			 * leak after the store to key_idx. i.e.
+			 * key_idx is the guard variable for signature
+			 * and key.
+			 */
+			__atomic_store_n(&prim_bkt->key_idx[i],
+					 new_idx,
+					 __ATOMIC_RELEASE);
+			EXPIRY_DBG("__atomic_store_n(&prim_bkt->key_idx[i(%i)], new_idx (%i), __ATOMIC_RELEASE)\n",
+				i, new_idx);
+
+		    refresh_age(h, recent, new_idx + 1);
+			break;
+		}
+	}
+	__hash_rw_writer_unlock(h);
+
+	if (i != RTE_HASH_BUCKET_ENTRIES)
+		return 0;
+
+	/* no empty entry */
+	return -1;
+}
+
+static inline int32_t
+__rte_hash_add_key_with_hash_recycle_keepdata(const struct rte_hash *h, const void *key,
+						hash_sig_t sig, void *data,
+						void * old_key, void * old_data, age_t recent)
 {
 	uint16_t short_sig;
 	uint32_t prim_bucket_idx, sec_bucket_idx;
@@ -1034,6 +1385,7 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 	ret = search_and_update(h, data, key, prim_bkt, short_sig);
 	if (ret != -1) {
 		__hash_rw_writer_unlock(h);
+		refresh_age(h, recent, ret + 1);
 		return ret;
 	}
 
@@ -1042,6 +1394,7 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 		ret = search_and_update(h, data, key, cur_bkt, short_sig);
 		if (ret != -1) {
 			__hash_rw_writer_unlock(h);
+			refresh_age(h, recent, ret + 1);
 			return ret;
 		}
 	}
@@ -1073,29 +1426,41 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 	 * not leak after the store of pdata in the key store. i.e. pdata is
 	 * the guard variable. Release the application data to the readers.
 	 */
+
+	EXPIRY_DBG("PTR_ADD slot_id is %i\n", slot_id);
+	EXPIRY_DBG("ATOMIC STORE CALLED WITH %p, %i\n", &new_k->pdata, data);
 	__atomic_store_n(&new_k->pdata,
 		data,
 		__ATOMIC_RELEASE);
+	EXPIRY_DBG("PDATA IS NOW %04X, idata %p\n", new_k->pdata, new_k->idata);
+
 	/* Copy key */
 	memcpy(new_k->key, key, h->key_len);
 
 	/* Find an empty slot and insert */
-	ret = rte_hash_cuckoo_insert_mw(h, prim_bkt, sec_bkt, key, data,
-					short_sig, slot_id, &ret_val);
+	ret = rte_hash_cuckoo_insert_mw_t(h, prim_bkt, sec_bkt, key, data,
+					short_sig, slot_id, &ret_val, old_key, old_data, recent );
 	if (ret == 0)
+	{
 		return slot_id - 1;
+	}
 	else if (ret == 1) {
 		enqueue_slot_back(h, cached_free_slots, slot_id);
 		return ret_val;
 	}
 
+
 	/* Primary bucket full, need to make space for new entry */
 	ret = rte_hash_cuckoo_make_space_mw(h, prim_bkt, sec_bkt, key, data,
 				short_sig, prim_bucket_idx, slot_id, &ret_val);
 	if (ret == 0)
+	{
+		refresh_age(h, recent, slot_id);
 		return slot_id - 1;
+	}
 	else if (ret == 1) {
 		enqueue_slot_back(h, cached_free_slots, slot_id);
+		refresh_age(h, recent, ret_val + 1);
 		return ret_val;
 	}
 
@@ -1104,15 +1469,20 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 				short_sig, sec_bucket_idx, slot_id, &ret_val);
 
 	if (ret == 0)
-		return slot_id - 1;
+	{
+	    refresh_age(h, recent, slot_id);
+	    return slot_id - 1;
+	}
 	else if (ret == 1) {
 		enqueue_slot_back(h, cached_free_slots, slot_id);
+		refresh_age(h, recent, ret_val + 1);
 		return ret_val;
 	}
 
 	/* if ext table not enabled, we failed the insertion */
 	if (!h->ext_table_support) {
 		enqueue_slot_back(h, cached_free_slots, slot_id);
+		refresh_age(h, recent, ret + 1);
 		return ret;
 	}
 
@@ -1150,6 +1520,7 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 						 slot_id,
 						 __ATOMIC_RELEASE);
 				__hash_rw_writer_unlock(h);
+				refresh_age(h, recent, slot_id);
 				return slot_id - 1;
 			}
 		}
@@ -1189,6 +1560,219 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 	last = rte_hash_get_last_bkt(sec_bkt);
 	last->next = &h->buckets_ext[ext_bkt_id - 1];
 	__hash_rw_writer_unlock(h);
+	refresh_age(h, recent, slot_id);
+	return slot_id - 1;
+
+failure:
+	__hash_rw_writer_unlock(h);
+	return ret;
+
+}
+static inline int32_t
+__rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
+						hash_sig_t sig, void *data, age_t recent)
+{
+	uint16_t short_sig;
+	uint32_t prim_bucket_idx, sec_bucket_idx;
+	struct rte_hash_bucket *prim_bkt, *sec_bkt, *cur_bkt;
+	struct rte_hash_key *new_k, *keys = h->key_store;
+	uint32_t ext_bkt_id = 0;
+	uint32_t slot_id;
+	int ret;
+	unsigned lcore_id;
+	unsigned int i;
+	struct lcore_cache *cached_free_slots = NULL;
+	int32_t ret_val;
+	struct rte_hash_bucket *last;
+
+	short_sig = get_short_sig(sig);
+	prim_bucket_idx = get_prim_bucket_index(h, sig);
+	sec_bucket_idx = get_alt_bucket_index(h, prim_bucket_idx, short_sig);
+	prim_bkt = &h->buckets[prim_bucket_idx];
+	sec_bkt = &h->buckets[sec_bucket_idx];
+	rte_prefetch0(prim_bkt);
+	rte_prefetch0(sec_bkt);
+
+	/* Check if key is already inserted in primary location */
+	__hash_rw_writer_lock(h);
+	ret = search_and_update(h, data, key, prim_bkt, short_sig);
+	if (ret != -1) {
+		__hash_rw_writer_unlock(h);
+		refresh_age(h, recent, ret + 1);
+		return ret;
+	}
+
+	/* Check if key is already inserted in secondary location */
+	FOR_EACH_BUCKET(cur_bkt, sec_bkt) {
+		ret = search_and_update(h, data, key, cur_bkt, short_sig);
+		if (ret != -1) {
+			__hash_rw_writer_unlock(h);
+			refresh_age(h, recent, ret + 1);
+			return ret;
+		}
+	}
+
+	__hash_rw_writer_unlock(h);
+
+	/* Did not find a match, so get a new slot for storing the new key */
+	if (h->use_local_cache) {
+		lcore_id = rte_lcore_id();
+		cached_free_slots = &h->local_free_slots[lcore_id];
+	}
+	slot_id = alloc_slot(h, cached_free_slots);
+	if (slot_id == EMPTY_SLOT) {
+		if (h->dq) {
+			__hash_rw_writer_lock(h);
+			ret = rte_rcu_qsbr_dq_reclaim(h->dq,
+					h->hash_rcu_cfg->max_reclaim_size,
+					NULL, NULL, NULL);
+			__hash_rw_writer_unlock(h);
+			if (ret == 0)
+				slot_id = alloc_slot(h, cached_free_slots);
+		}
+		if (slot_id == EMPTY_SLOT)
+			return -ENOSPC;
+	}
+
+	new_k = RTE_PTR_ADD(keys, slot_id * h->key_entry_size);
+	/* The store to application data (by the application) at *data should
+	 * not leak after the store of pdata in the key store. i.e. pdata is
+	 * the guard variable. Release the application data to the readers.
+	 */
+
+	EXPIRY_DBG("ATOMIC STORE CALLED WITH %p, %i\n", &new_k->pdata, data);
+	__atomic_store_n(&new_k->pdata,
+		data,
+		__ATOMIC_RELEASE);
+	EXPIRY_DBG("KEY at %p\n", new_k);
+	/* Copy key */
+	memcpy(new_k->key, key, h->key_len);
+
+	/* Find an empty slot and insert */
+	ret = rte_hash_cuckoo_insert_mw(h, prim_bkt, sec_bkt, key, data,
+					short_sig, slot_id, &ret_val);
+	if (ret == 0)
+	{
+		refresh_age(h, recent, slot_id);
+		return slot_id - 1;
+	}
+	else if (ret == 1) {
+		enqueue_slot_back(h, cached_free_slots, slot_id);
+		refresh_age(h, recent, ret_val + 1);
+		return ret_val;
+	}
+
+	/* Primary bucket full, need to make space for new entry */
+	ret = rte_hash_cuckoo_make_space_mw(h, prim_bkt, sec_bkt, key, data,
+				short_sig, prim_bucket_idx, slot_id, &ret_val);
+	if (ret == 0)
+	{
+		refresh_age(h, recent, slot_id);
+		return slot_id - 1;
+	}
+	else if (ret == 1) {
+		enqueue_slot_back(h, cached_free_slots, slot_id);
+		refresh_age(h, recent, ret_val + 1);
+		return ret_val;
+	}
+
+	/* Also search secondary bucket to get better occupancy */
+	ret = rte_hash_cuckoo_make_space_mw(h, sec_bkt, prim_bkt, key, data,
+				short_sig, sec_bucket_idx, slot_id, &ret_val);
+
+	if (ret == 0)
+	{
+	    refresh_age(h, recent, slot_id);
+	    return slot_id - 1;
+	}
+	else if (ret == 1) {
+		enqueue_slot_back(h, cached_free_slots, slot_id);
+		refresh_age(h, recent, ret_val + 1);
+		return ret_val;
+	}
+
+	/* if ext table not enabled, we failed the insertion */
+	if (!h->ext_table_support) {
+		enqueue_slot_back(h, cached_free_slots, slot_id);
+		refresh_age(h, recent,  ret + 1);
+		return ret;
+	}
+
+	/* Now we need to go through the extendable bucket. Protection is needed
+	 * to protect all extendable bucket processes.
+	 */
+	__hash_rw_writer_lock(h);
+	/* We check for duplicates again since could be inserted before the lock */
+	ret = search_and_update(h, data, key, prim_bkt, short_sig);
+	if (ret != -1) {
+		enqueue_slot_back(h, cached_free_slots, slot_id);
+		goto failure;
+	}
+
+	FOR_EACH_BUCKET(cur_bkt, sec_bkt) {
+		ret = search_and_update(h, data, key, cur_bkt, short_sig);
+		if (ret != -1) {
+			enqueue_slot_back(h, cached_free_slots, slot_id);
+			goto failure;
+		}
+	}
+
+	/* Search sec and ext buckets to find an empty entry to insert. */
+	FOR_EACH_BUCKET(cur_bkt, sec_bkt) {
+		for (i = 0; i < RTE_HASH_BUCKET_ENTRIES; i++) {
+			/* Check if slot is available */
+			if (likely(cur_bkt->key_idx[i] == EMPTY_SLOT)) {
+				cur_bkt->sig_current[i] = short_sig;
+				/* Store to signature and key should not
+				 * leak after the store to key_idx. i.e.
+				 * key_idx is the guard variable for signature
+				 * and key.
+				 */
+				__atomic_store_n(&cur_bkt->key_idx[i],
+						 slot_id,
+						 __ATOMIC_RELEASE);
+				__hash_rw_writer_unlock(h);
+				refresh_age(h, recent, slot_id);
+				return slot_id - 1;
+			}
+		}
+	}
+
+	/* Failed to get an empty entry from extendable buckets. Link a new
+	 * extendable bucket. We first get a free bucket from ring.
+	 */
+	if (rte_ring_sc_dequeue_elem(h->free_ext_bkts, &ext_bkt_id,
+						sizeof(uint32_t)) != 0 ||
+					ext_bkt_id == 0) {
+		if (h->dq) {
+			if (rte_rcu_qsbr_dq_reclaim(h->dq,
+					h->hash_rcu_cfg->max_reclaim_size,
+					NULL, NULL, NULL) == 0) {
+				rte_ring_sc_dequeue_elem(h->free_ext_bkts,
+							 &ext_bkt_id,
+							 sizeof(uint32_t));
+			}
+		}
+		if (ext_bkt_id == 0) {
+			ret = -ENOSPC;
+			goto failure;
+		}
+	}
+
+	/* Use the first location of the new bucket */
+	(h->buckets_ext[ext_bkt_id - 1]).sig_current[0] = short_sig;
+	/* Store to signature and key should not leak after
+	 * the store to key_idx. i.e. key_idx is the guard variable
+	 * for signature and key.
+	 */
+	__atomic_store_n(&(h->buckets_ext[ext_bkt_id - 1]).key_idx[0],
+			 slot_id,
+			 __ATOMIC_RELEASE);
+	/* Link the new bucket to sec bucket linked list */
+	last = rte_hash_get_last_bkt(sec_bkt);
+	last->next = &h->buckets_ext[ext_bkt_id - 1];
+	__hash_rw_writer_unlock(h);
+	refresh_age(h, recent, slot_id);
 	return slot_id - 1;
 
 failure:
@@ -1202,14 +1786,14 @@ rte_hash_add_key_with_hash(const struct rte_hash *h,
 			const void *key, hash_sig_t sig)
 {
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
-	return __rte_hash_add_key_with_hash(h, key, sig, 0);
+	return __rte_hash_add_key_with_hash(h, key, sig, 0, 0);
 }
 
 int32_t
 rte_hash_add_key(const struct rte_hash *h, const void *key)
 {
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
-	return __rte_hash_add_key_with_hash(h, key, rte_hash_hash(h, key), 0);
+	return __rte_hash_add_key_with_hash(h, key, rte_hash_hash(h, key), 0, 0);
 }
 
 int
@@ -1219,11 +1803,35 @@ rte_hash_add_key_with_hash_data(const struct rte_hash *h,
 	int ret;
 
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
-	ret = __rte_hash_add_key_with_hash(h, key, sig, data);
+	ret = __rte_hash_add_key_with_hash(h, key, sig, data, 0);
 	if (ret >= 0)
 		return 0;
 	else
 		return ret;
+}
+
+int
+rte_hash_add_key_data_recycle_keepdata_t(const struct rte_hash *h,
+			const void *key, void *data,
+			void * old_key, void * old_data, age_t recent)
+{
+	int ret;
+
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
+	ret = __rte_hash_add_key_with_hash_recycle_keepdata(h, key, rte_hash_hash(h, key), data, old_key, old_data, recent);
+	print_table(h);
+	return ret;
+}
+int
+rte_hash_add_key_data_recycle_keepdata(const struct rte_hash *h,
+			const void *key, void *data,
+			void * old_key, void * old_data)
+{
+	int ret;
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
+	ret = __rte_hash_add_key_with_hash_recycle_keepdata(h, key, rte_hash_hash(h, key), data, old_key, old_data, 0);
+	print_table(h);
+	return ret;
 }
 
 int
@@ -1233,7 +1841,7 @@ rte_hash_add_key_data(const struct rte_hash *h, const void *key, void *data)
 
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
 
-	ret = __rte_hash_add_key_with_hash(h, key, rte_hash_hash(h, key), data);
+	ret = __rte_hash_add_key_with_hash(h, key, rte_hash_hash(h, key), data, 0);
 	if (ret >= 0)
 		return 0;
 	else
@@ -1248,12 +1856,36 @@ search_one_bucket_l(const struct rte_hash *h, const void *key,
 {
 	int i;
 	struct rte_hash_key *k, *keys = h->key_store;
+	EXPIRY_DBG("LOOKING FOR KEY %08X %08X %08X %08X\n",
+		((const uint64_t *) key)[0], ((const uint64_t *) key)[1],
+		((const uint64_t *) key)[2],	((const uint64_t *) key)[3]);
 
 	for (i = 0; i < RTE_HASH_BUCKET_ENTRIES; i++) {
+		EXPIRY_DBG("COMPARING at slot %i signature %04X (at %p) with signature %04X. Empty slot? %i \n",
+				i, bkt->sig_current[i], 
+				&(bkt->sig_current[i]), 
+				sig, 
+				bkt->key_idx[i] == EMPTY_SLOT);
+
 		if (bkt->sig_current[i] == sig &&
 				bkt->key_idx[i] != EMPTY_SLOT) {
 			k = (struct rte_hash_key *) ((char *)keys +
 					bkt->key_idx[i] * h->key_entry_size);
+
+			// EXPIRY_DBG("Signatures are equal, check the full keys: %04X %04X (%p)\n", * (uint64_t*) key,
+			// 		*(uint64_t *) (k->key),
+			// 		 (uint64_t *) (k->key));
+			EXPIRY_DBG("COMPARING KEYS '%08X %08X %08X %08X'  '%08X %08X %08X %08X' EQUAL? %i. %p %p\n",
+
+				((const uint64_t *) key)[0], ((const uint64_t *) key)[1],
+				((const uint64_t *) key)[2],	((const uint64_t *) key)[3],
+				((const uint64_t *) k->key)[0], ((const uint64_t *) k->key)[1],
+				((const uint64_t *) k->key)[2],	((const uint64_t *) k->key)[3],
+				(rte_hash_cmp_eq(key, k->key, h) == 0),
+				key,
+				k->key
+				);
+
 
 			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
 				if (data != NULL)
@@ -1411,12 +2043,22 @@ __rte_hash_lookup_with_hash_lf(const struct rte_hash *h, const void *key,
 
 static inline int32_t
 __rte_hash_lookup_with_hash(const struct rte_hash *h, const void *key,
-					hash_sig_t sig, void **data)
+					hash_sig_t sig, void **data, age_t recent)
 {
+	int ret = 0;
 	if (h->readwrite_concur_lf_support)
-		return __rte_hash_lookup_with_hash_lf(h, key, sig, data);
+		ret = __rte_hash_lookup_with_hash_lf(h, key, sig, data);
 	else
-		return __rte_hash_lookup_with_hash_l(h, key, sig, data);
+		ret = __rte_hash_lookup_with_hash_l(h, key, sig, data);
+	
+	if( ret >= 0 && h->lifetime )
+	{
+	    EXPIRY_DBG( "LOOKUP result is %i, age is %i\n", ret, get_age(h, recent, ret));
+	    refresh_age(h, recent, ret + 1);
+	}
+
+	return ret;
+
 }
 
 int32_t
@@ -1424,14 +2066,28 @@ rte_hash_lookup_with_hash(const struct rte_hash *h,
 			const void *key, hash_sig_t sig)
 {
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
-	return __rte_hash_lookup_with_hash(h, key, sig, NULL);
+	
+	return __rte_hash_lookup_with_hash(h, key, sig, NULL, 0);
+}
+int32_t
+rte_hash_lookup_with_hash_t(const struct rte_hash *h,
+			const void *key, hash_sig_t sig, age_t recent)
+{
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
+	return __rte_hash_lookup_with_hash(h, key, sig, NULL, recent);
 }
 
 int32_t
 rte_hash_lookup(const struct rte_hash *h, const void *key)
 {
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
-	return __rte_hash_lookup_with_hash(h, key, rte_hash_hash(h, key), NULL);
+	return __rte_hash_lookup_with_hash(h, key, rte_hash_hash(h, key), NULL, 0);
+}
+int32_t
+rte_hash_lookup_t(const struct rte_hash *h, const void *key, age_t recent)
+{
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
+	return __rte_hash_lookup_with_hash(h, key, rte_hash_hash(h, key), NULL, recent);
 }
 
 int
@@ -1439,14 +2095,20 @@ rte_hash_lookup_with_hash_data(const struct rte_hash *h,
 			const void *key, hash_sig_t sig, void **data)
 {
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
-	return __rte_hash_lookup_with_hash(h, key, sig, data);
+	return __rte_hash_lookup_with_hash(h, key, sig, data, 0);
+}
+
+int
+rte_hash_lookup_data_t(const struct rte_hash *h, const void *key, void **data, age_t recent)
+{
+	return __rte_hash_lookup_with_hash(h, key, rte_hash_hash(h, key), data, recent);
 }
 
 int
 rte_hash_lookup_data(const struct rte_hash *h, const void *key, void **data)
 {
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
-	return __rte_hash_lookup_with_hash(h, key, rte_hash_hash(h, key), data);
+	return __rte_hash_lookup_with_hash(h, key, rte_hash_hash(h, key), data, 0);
 }
 
 static int
@@ -1530,9 +2192,11 @@ rte_hash_rcu_qsbr_add(struct rte_hash *h, struct rte_hash_rcu_config *cfg)
 		return 1;
 	}
 
+	ALLOC_PRINT(sizeof(struct rte_hash_rcu_config));
 	hash_rcu_cfg = rte_zmalloc(NULL, sizeof(struct rte_hash_rcu_config), 0);
 	if (hash_rcu_cfg == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		RTE_LOG(ERR, HASH, "%s:%i memory allocation failed\n",
+				__FILE__, __LINE__);
 		return 1;
 	}
 
@@ -1809,7 +2473,26 @@ rte_hash_get_key_with_position(const struct rte_hash *h, const int32_t position,
 
 	if (position !=
 	    __rte_hash_lookup_with_hash(h, *key, rte_hash_hash(h, *key),
-					NULL)) {
+					NULL, 0)) {
+		return -ENOENT;
+	}
+
+	return 0;
+}
+int
+rte_hash_get_key_with_position_t(const struct rte_hash *h, const int32_t position,
+			       void **key, age_t recent)
+{
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
+
+	struct rte_hash_key *k, *keys = h->key_store;
+	k = (struct rte_hash_key *) ((char *) keys + (position + 1) *
+				     h->key_entry_size);
+	*key = k->key;
+
+	if (position !=
+	    __rte_hash_lookup_with_hash(h, *key, rte_hash_hash(h, *key),
+					NULL, recent)) {
 		return -ENOENT;
 	}
 

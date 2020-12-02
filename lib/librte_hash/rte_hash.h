@@ -56,6 +56,12 @@ extern "C" {
  */
 #define RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF 0x20
 
+/** Flag to always recycle entries. When set, the entries will be replaced 
+ * as soon as they expire. Otherwise, they will be replaced only when the
+ * hash table is full.
+ */
+#define RTE_HASH_EXTRA_FLAGS_ALWAYS_RECYCLE 0x40
+
 /**
  * The type of hash value of a key.
  * It should be a value of at least 32bit with fully random pattern.
@@ -79,6 +85,8 @@ typedef void (*rte_hash_free_key_data)(void *p, void *key_data);
 /**
  * Parameters used when creating the hash table.
  */
+
+typedef uint16_t age_t;
 struct rte_hash_parameters {
 	const char *name;		/**< Name of the hash. */
 	uint32_t entries;		/**< Total hash table entries. */
@@ -88,6 +96,7 @@ struct rte_hash_parameters {
 	uint32_t hash_func_init_val;	/**< Init value used by hash_func. */
 	int socket_id;			/**< NUMA Socket ID for memory. */
 	uint8_t extra_flag;		/**< Indicate if additional parameters are present. */
+	age_t lifetime;			/**< The timeout after which an entry is considered expired. */
 };
 
 /** RCU reclamation modes */
@@ -277,6 +286,52 @@ int32_t
 rte_hash_add_key_with_hash_data(const struct rte_hash *h, const void *key,
 						hash_sig_t sig, void *data);
 
+
+/**
+ * Add a key-value pair with a pre-computed hash value
+ * to an existing hash table.
+ * This operation is not multi-thread safe
+ * and should only be called from one thread by default.
+ * Thread safety can be enabled by setting flag during
+ * table creation.
+ * If the key exists already in the table, this API updates its value
+ * with 'data' passed in this API. It is the responsibility of
+ * the application to manage any memory associated with the old value.
+ * The readers might still be using the old value even after this API
+ * has returned.
+ *
+ * If the table is full, replace an expired entry of the same bucket with
+ * the new key, keeping the old data and the old position.
+ * The data and the old key are returned in the memory area passed by the 
+ * pointers old_data and old_key
+ *
+ * @param h
+ *   Hash table to add the key to.
+ * @param key
+ *   Key to add to the hash table.
+ * @param sig
+ *   Precomputed hash value for 'key'
+ * @param data
+ *   Data to add to the hash table.
+ * @param old_data
+ *   Pointer to the memory area to copy the data in case of recycle
+ * @param old_key
+ *   Pointer to the memory area to copt the old key in case of recycle
+ * @return
+ *   - A positive value if an entry has been replaced, representing the index replaced
+ *   - 0 if added successfully
+ *   - -EINVAL if the parameters are invalid.
+ *   - -ENOSPC if there is no space in the hash for this key.
+ */
+int
+rte_hash_add_key_data_recycle_keepdata(const struct rte_hash *h,
+			const void *key, void *data,
+			void * old_key, void *);
+
+int
+rte_hash_add_key_data_recycle_keepdata_t(const struct rte_hash *h,
+			const void *key, void *data,
+			void * old_key, void * old_data, age_t recent);
 /**
  * Add a key to an existing hash table. This operation is not multi-thread safe
  * and should only be called from one thread by default.
@@ -404,6 +459,9 @@ rte_hash_del_key_with_hash(const struct rte_hash *h, const void *key, hash_sig_t
 int
 rte_hash_get_key_with_position(const struct rte_hash *h, const int32_t position,
 			       void **key);
+int
+rte_hash_get_key_with_position_t(const struct rte_hash *h, const int32_t position,
+			       void **key, age_t recent);
 
 /**
  * @warning
@@ -456,6 +514,8 @@ rte_hash_free_key_with_position(const struct rte_hash *h,
  */
 int
 rte_hash_lookup_data(const struct rte_hash *h, const void *key, void **data);
+int
+rte_hash_lookup_data_t(const struct rte_hash *h, const void *key, void **data, age_t recent);
 
 /**
  * Find a key-value pair with a pre-computed hash value
@@ -483,6 +543,9 @@ int
 rte_hash_lookup_with_hash_data(const struct rte_hash *h, const void *key,
 					hash_sig_t sig, void **data);
 
+int
+rte_hash_lookup_with_hash_data_t(const struct rte_hash *h, const void *key,
+					hash_sig_t sig, void **data, age_t recent);
 /**
  * Find a key in the hash table.
  * This operation is multi-thread safe with regarding to other lookup threads.
@@ -502,6 +565,8 @@ rte_hash_lookup_with_hash_data(const struct rte_hash *h, const void *key,
  */
 int32_t
 rte_hash_lookup(const struct rte_hash *h, const void *key);
+int32_t
+rte_hash_lookup_t(const struct rte_hash *h, const void *key, age_t recent);
 
 /**
  * Find a key in the hash table.
@@ -525,6 +590,9 @@ rte_hash_lookup(const struct rte_hash *h, const void *key);
 int32_t
 rte_hash_lookup_with_hash(const struct rte_hash *h,
 				const void *key, hash_sig_t sig);
+int32_t
+rte_hash_lookup_with_hash_t(const struct rte_hash *h,
+				const void *key, hash_sig_t sig, age_t recent);
 
 /**
  * Calc a hash value by key.
